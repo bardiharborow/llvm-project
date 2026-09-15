@@ -139,6 +139,9 @@ private:
   MapVector<StringRef, std::vector<const Record *>>
   collectLibrariesByName() const;
 
+  // Whether any member of \p Lib has a calling convention using DefaultCC.
+  bool libraryReferencesDefaultCC(const Record *Lib) const;
+
   void emitRuntimeLibcallsInfoMemberDecls(raw_ostream &OS) const;
 
   void emitSystemRuntimeLibrarySetCalls(raw_ostream &OS) const;
@@ -727,6 +730,22 @@ static StringRef libFuncKey(const Record *Lib) {
                                         : Lib->getValueAsString("LibraryName");
 }
 
+bool RuntimeLibcallEmitter::libraryReferencesDefaultCC(
+    const Record *Lib) const {
+  SetTheory Sets;
+  DenseMap<const RuntimeLibcallImpl *,
+           std::pair<std::vector<const Record *>, const Record *>>
+      Func2Preds;
+  Sets.addExpander("LibcallImpls", std::make_unique<LibcallPredicateExpander>(
+                                       Libcalls, Func2Preds));
+  SetTheory::RecSet Elements;
+  Sets.evaluate(Lib->getValueInit("Impls"), Elements, Lib->getLoc());
+  return any_of(Func2Preds, [](const auto &ImplAndPreds) {
+    const Record *CC = ImplAndPreds.second.second;
+    return CC && CC->getValueAsString("CallingConv").contains("DefaultCC");
+  });
+}
+
 MapVector<StringRef, std::vector<const Record *>>
 RuntimeLibcallEmitter::collectLibrariesByName() const {
   MapVector<StringRef, std::vector<const Record *>> LibsByName;
@@ -778,11 +797,10 @@ void RuntimeLibcallEmitter::emitSystemRuntimeLibrarySetCalls(
     }
   }
 
-  // Collect, per library name, the distinct DefaultLibcallCallingConv snippets
-  // its consuming system libraries supply (a plain Record walk; no member
-  // expansion). emitLibraryFunction, which already expands the members, picks
-  // the snippet for a library that names the DefaultCC sentinel and diagnoses a
-  // missing (none) or ambiguous (more than one) snippet.
+  // Collect, per library name, the distinct DefaultLibcallCallingConv of each
+  // system library referencing a library that uses DefaultCC. Other libraries
+  // sharing the name do not contribute. emitLibraryFunction diagnoses a missing
+  // or ambiguous DefaultCC.
   MapVector<StringRef, SetVector<StringRef>> DefaultCCsByLibName;
   for (const Record *R : AllLibs) {
     const Record *DefaultCCClass =
@@ -804,7 +822,7 @@ void RuntimeLibcallEmitter::emitSystemRuntimeLibrarySetCalls(
         Lib = Def;
       else if (Def->isSubClassOf("LibraryRef"))
         Lib = Def->getValueAsDef("Library");
-      if (!Lib)
+      if (!Lib || !libraryReferencesDefaultCC(Lib))
         continue;
       DefaultCCsByLibName[Lib->getValueAsString("LibraryName")].insert(
           DefaultCC);
