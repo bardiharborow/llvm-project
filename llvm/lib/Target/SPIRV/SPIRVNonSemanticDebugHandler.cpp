@@ -340,6 +340,7 @@ void SPIRVNonSemanticDebugHandler::beginModule(Module *M) {
   LexicalBlocks.clear();
   DebugScopeRegs.clear();
   ScopesInProgress.clear();
+  HasRelaxedExtInst = false;
   FailedScopes.clear();
   DebugInlinedAtRegs.clear();
   ScopeToPathOpStringReg.clear();
@@ -453,6 +454,12 @@ void SPIRVNonSemanticDebugHandler::prepareModuleOutput(
   // Add the extension to requirements so OpExtension is output.
   MAI.Reqs.addExtension(SPIRV::Extension::SPV_KHR_non_semantic_info);
 
+  HasRelaxedExtInst = ST.canUseExtension(
+      SPIRV::Extension::SPV_KHR_relaxed_extended_instruction);
+  if (HasRelaxedExtInst)
+    MAI.Reqs.addExtension(
+        SPIRV::Extension::SPV_KHR_relaxed_extended_instruction);
+
   // Add the NonSemantic.Shader.DebugInfo.100 entry to ExtInstSetMap so that
   // outputOpExtInstImports() emits the OpExtInstImport instruction. Allocate a
   // fresh result ID for it now; the same ID is used in emitExtInst() operands.
@@ -540,11 +547,23 @@ MCRegister SPIRVNonSemanticDebugHandler::emitOpConstantI32(
 MCRegister SPIRVNonSemanticDebugHandler::emitExtInst(
     SPIRV::NonSemanticExtInst::NonSemanticExtInst Opcode,
     MCRegister VoidTypeReg, MCRegister ExtInstSetReg,
-    ArrayRef<MCRegister> Operands, SPIRV::ModuleAnalysisInfo &MAI) {
-  MCRegister Reg = MAI.getNextIDRegister();
+    ArrayRef<MCRegister> Operands, SPIRV::ModuleAnalysisInfo &MAI,
+    std::optional<MCRegister> ResultReg) {
+  assert((!ResultReg || ResultReg->isValid()) &&
+         "ResultReg must be a valid id when provided");
+  MCRegister Reg = ResultReg ? *ResultReg : MAI.getNextIDRegister();
+
+  // If the current instruction uses a forward id, it must be tagged with
+  // OpExtInstWithForwardRefsKHR. This only happens when forward references are
+  // supported, when emitting DIScope nodes.
+  bool HasForwardRef =
+      HasRelaxedExtInst && any_of(Operands, [&](MCRegister Op) {
+        return is_contained(make_second_range(ScopesInProgress), Op);
+      });
 
   MCInst Inst;
-  Inst.setOpcode(SPIRV::OpExtInst);
+  Inst.setOpcode(HasForwardRef ? SPIRV::OpExtInstWithForwardRefsKHR
+                               : SPIRV::OpExtInst);
   Inst.addOperand(MCOperand::createReg(Reg));
   Inst.addOperand(MCOperand::createReg(VoidTypeReg));
   Inst.addOperand(MCOperand::createReg(ExtInstSetReg));
@@ -760,8 +779,11 @@ MCRegister SPIRVNonSemanticDebugHandler::findOrEmitOpTypeInt32(
 }
 
 // Each node emits its dependencies first. E.g. for `void f() { struct L; }`,
-// node L emits f, then L. For `struct S { S *p; }`, S* is a back edge, so S
-// is emitted without member p.
+// node L emits f, then L. Entering a scope reserves its result id. For
+// `struct S { S *p; }`, S* is a back edge, and without
+// SPV_KHR_relaxed_extended_instruction the edge is dropped and the reserved id
+// stays unused. With it, that id is used with OpExtInstWithForwardRefsKHR, and
+// a later failure defines it as DebugInfoNone.
 auto SPIRVNonSemanticDebugHandler::getOrCreateDebugScope(const DIScope *S)
     -> EmitResult<MCRegister> {
   if (!S || FailedScopes.contains(S))
@@ -769,16 +791,54 @@ auto SPIRVNonSemanticDebugHandler::getOrCreateDebugScope(const DIScope *S)
   if (auto Reg = lookupOptReg(DebugScopeRegs, S))
     return EmitResult<MCRegister>::emitted(*Reg);
 
-  // Mark the node as in progress while its dependencies are resolved/emitted.
-  // This also prevents cycles from happening.
-  if (!ScopesInProgress.insert(S).second)
-    return EmitResult<MCRegister>::inProgress();
+  // Mark the scope node as in progress while its dependencies are
+  // resolved/emitted.
+  auto [It, FirstVisit] = ScopesInProgress.try_emplace(S);
+  if (!FirstVisit) { // We hit a back edge, it is not the first insertion.
+    if (!HasRelaxedExtInst)
+      return EmitResult<MCRegister>::inProgress(); // No support for forward
+                                                   // refs.
+    // Use the reserved id for the back edge when forward references are
+    // supported.
+    MCRegister ReservedId = It->second;
+    assert(ReservedId.isValid() && "in-progress scope must have a reserved id");
+    return EmitResult<MCRegister>::emitted(ReservedId);
+  }
+
+  // Reserve the result id first: a dependency may refer back to this scope.
+  assert(CurrentMAI && "debug scope id allocation requires CurrentMAI");
+  MCRegister Id = CurrentMAI->getNextIDRegister();
+  assert(Id.isValid() && "debug scope id must be a valid register");
+  It->second = Id;
 
   EmitResult<PreparedScope> P = emitDebugScope(S);
-  ScopesInProgress.erase(S);
-  assert((!P || !GlobalNSDIEnabled) &&
-         "debug type or scope created after module-scope NSDI emission");
+  assert((!HasRelaxedExtInst || P.Status == EmitStatus::Emitted ||
+          P.Status == EmitStatus::Unsupported) &&
+         "InProgress is only returned when forward references are unsupported");
   if (!P) {
+    ScopesInProgress.erase(S);
+    // P here is either unsupported or in progress. When forward references are
+    // supported, P can only be unsupported.
+
+    if (HasRelaxedExtInst) {
+      assert(P.Status == EmitStatus::Unsupported &&
+             "Unsupported is the only supported status here when forward "
+             "references are supported");
+      // The emission was not successful because it is not supported.
+      // However, this id might have been used by a back edge as a forward
+      // reference. We are conservative to keep the implementation simple and
+      // define it as DebugInfoNone because the forward reference requires a
+      // definition.
+      SPIRV::ModuleAnalysisInfo &MAI = *CurrentMAI;
+      emitExtInst(SPIRV::NonSemanticExtInst::DebugInfoNone,
+                  getOrEmitOpTypeVoidReg(MAI), MAI.getExtInstSetReg(NSSet), {},
+                  MAI, Id);
+    }
+
+    // InProgress is a dropped back edge (when forward references are not
+    // supported). Leave it out of FailedScopes so a later walk can retry the
+    // scope. Regardless of forward references, cache unsupported scopes to
+    // avoid retrying them.
     if (P.Status == EmitStatus::Unsupported)
       FailedScopes.insert(S);
     return P.Status == EmitStatus::InProgress
@@ -790,7 +850,12 @@ auto SPIRVNonSemanticDebugHandler::getOrCreateDebugScope(const DIScope *S)
   SPIRV::ModuleAnalysisInfo &MAI = *CurrentMAI;
   MCRegister Reg =
       emitExtInst(P.Value->Opcode, getOrEmitOpTypeVoidReg(MAI),
-                  MAI.getExtInstSetReg(NSSet), P.Value->Operands, MAI);
+                  MAI.getExtInstSetReg(NSSet), P.Value->Operands, MAI, Id);
+  assert(Reg == Id &&
+         "debug scope result id must reuse the id reserved at entry");
+  ScopesInProgress.erase(S);
+  assert(!GlobalNSDIEnabled &&
+         "debug type or scope created after module-scope NSDI emission");
   DebugScopeRegs[S] = Reg;
   return EmitResult<MCRegister>::emitted(Reg);
 }
