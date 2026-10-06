@@ -4894,6 +4894,27 @@ func.func @iterator_bad_result_type(%lb : index, %ub : index, %st : index) {
 
 // -----
 
+func.func @iterator_iv_count_mismatch(%lb : i64, %ub : i64, %st : i64, %x : !llvm.ptr) {
+  // expected-error@+1 {{number of range arguments and IVs do not match}}
+  %0 = "omp.iterator"(%lb, %ub, %st) <{operandSegmentSizes = array<i32: 1, 1, 1>}> ({
+    omp.yield(%x : !llvm.ptr)
+  }) : (i64, i64, i64) -> !omp.iterated<!llvm.ptr>
+  return
+}
+
+// -----
+
+func.func @iterator_iv_type_mismatch(%lb : i32, %ub : i32, %st : i32, %x : !llvm.ptr) {
+  // expected-error@+1 {{range argument type does not match corresponding IV type}}
+  %0 = "omp.iterator"(%lb, %ub, %st) <{operandSegmentSizes = array<i32: 1, 1, 1>}> ({
+  ^bb0(%i: i64):
+    omp.yield(%x : !llvm.ptr)
+  }) : (i32, i32, i32) -> !omp.iterated<!llvm.ptr>
+  return
+}
+
+// -----
+
 func.func @iterator_zero_step(%s2 : !llvm.struct<(ptr, i64)>) {
   %lb = arith.constant 1 : index
   %ub = arith.constant 4 : index

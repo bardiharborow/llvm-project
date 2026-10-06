@@ -150,3 +150,57 @@ llvm.func @depend_2d(%a : !llvm.ptr, %b : !llvm.ptr) {
 // CHECK: %[[PI:.*]] = ptrtoint ptr %[[P]] to i64
 // CHECK: store i64 %[[PI]], ptr
 // CHECK: call i32 @__kmpc_omp_task_with_deps({{.*}}, i32 6, ptr
+
+// A block argument fed by the induction value keeps its declared type.
+llvm.func @depend_narrow(%x : !llvm.ptr) {
+  %lo = llvm.mlir.constant(1 : i32) : i32
+  %hi = llvm.mlir.constant(2 : i32) : i32
+  %it = omp.iterator(%i: i32) = (%lo to %hi step %lo) {
+    llvm.br ^next(%i : i32)
+  ^next(%v: i32):
+    llvm.store %v, %x : i32, !llvm.ptr
+    omp.yield(%x : !llvm.ptr)
+  } -> !omp.iterated<!llvm.ptr>
+  omp.taskwait depend(taskdependin -> %it : !omp.iterated<!llvm.ptr>)
+  llvm.return
+}
+
+// CHECK-LABEL: define void @depend_narrow
+// CHECK: omp_dep_iterator.body:
+// CHECK: %[[IDX:.*]] = trunc i64 %{{.*}} to i32
+// CHECK: %[[OFF:.*]] = mul i32 %[[IDX]], 1
+// CHECK: %[[IV:.*]] = add i32 1, %[[OFF]]
+// CHECK: %[[V:.*]] = phi i32 [ %[[IV]], %omp.iterator.region ]
+// CHECK: store i32 %[[V]], ptr
+
+// An empty dynamic range, e.g. m = 2, must not evaluate the region.
+llvm.func @depend_empty_dynamic(%a : !llvm.ptr, %m : i32, %d : i32) {
+  %c2 = llvm.mlir.constant(2 : i32) : i32
+  %c3 = llvm.mlir.constant(3 : i32) : i32
+  %it = omp.iterator(%i: i32) = (%c3 to %m step %c2) {
+    %q = llvm.sdiv %i, %d : i32
+    llvm.br ^bb1(%q : i32)
+  ^bb1(%k : i32):
+    %p = llvm.getelementptr %a[%k] : (!llvm.ptr, i32) -> !llvm.ptr, i32
+    omp.yield(%p : !llvm.ptr)
+  } -> !omp.iterated<!llvm.ptr>
+  omp.task depend(taskdependin -> %it : !omp.iterated<!llvm.ptr>) {
+    omp.terminator
+  }
+  llvm.return
+}
+
+// CHECK-LABEL: define void @depend_empty_dynamic
+// CHECK-SAME: (ptr %{{.*}}, i32 %[[M:[0-9]+]], i32 %{{.*}})
+// CHECK: %[[STOP:.*]] = sext i32 %[[M]] to i33
+// CHECK: %[[LB:.*]] = select i1 false, i33 %[[STOP]], i33 3
+// CHECK: %[[UB:.*]] = select i1 false, i33 3, i33 %[[STOP]]
+// CHECK: %[[EMPTY:.*]] = icmp slt i33 %[[UB]], %[[LB]]
+// CHECK: %[[COUNT:.*]] = select i1 %[[EMPTY]], i33 0, i33 %{{.*}}
+// CHECK: %[[TRIPS:.*]] = zext i33 %[[COUNT]] to i64
+// CHECK: %[[TOTAL:.*]] = mul i64 1, %[[TRIPS]]
+// CHECK: omp_dep_iterator.cond:
+// CHECK: icmp ult i64 %omp_dep_iterator.iv, %[[TOTAL]]
+// CHECK: omp_dep_iterator.body:
+// CHECK: omp.iterator.region:
+// CHECK: sdiv i32 %omp.it.phys_iv,

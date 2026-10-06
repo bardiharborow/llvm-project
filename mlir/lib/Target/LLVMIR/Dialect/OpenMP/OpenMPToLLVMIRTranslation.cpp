@@ -2855,8 +2855,9 @@ private:
 /// mlir::omp::IteratorOp for lowering to LLVM IR.
 ///
 /// It computes the per-dimension trip counts and the total linearized trip
-/// count, casted to i64. These are used to build a canonical loop and to
-/// reconstruct the physical induction variables inside the loop body.
+/// count as i64. Bounds and steps keep their declared type so that the
+/// physical induction variables can be reconstructed in that type inside the
+/// loop body.
 class IteratorInfo {
 private:
   llvm::SmallVector<llvm::Value *> lowerBounds;
@@ -2865,18 +2866,6 @@ private:
   llvm::SmallVector<llvm::Value *> trips;
   unsigned dims;
   llvm::Value *totalTrips;
-
-  llvm::Value *lookUpAsI64(mlir::Value val, const LLVM::ModuleTranslation &mt,
-                           llvm::IRBuilderBase &builder) {
-    llvm::Value *v = mt.lookupValue(val);
-    if (!v)
-      return nullptr;
-    if (v->getType()->isIntegerTy(64))
-      return v;
-    if (v->getType()->isIntegerTy())
-      return builder.CreateSExtOrTrunc(v, builder.getInt64Ty());
-    return nullptr;
-  }
 
 public:
   IteratorInfo(mlir::omp::IteratorOp itersOp,
@@ -2889,12 +2878,12 @@ public:
     trips.resize(dims);
 
     for (unsigned d = 0; d < dims; ++d) {
-      llvm::Value *lb = lookUpAsI64(itersOp.getLoopLowerBounds()[d],
-                                    moduleTranslation, builder);
-      llvm::Value *ub = lookUpAsI64(itersOp.getLoopUpperBounds()[d],
-                                    moduleTranslation, builder);
+      llvm::Value *lb =
+          moduleTranslation.lookupValue(itersOp.getLoopLowerBounds()[d]);
+      llvm::Value *ub =
+          moduleTranslation.lookupValue(itersOp.getLoopUpperBounds()[d]);
       llvm::Value *st =
-          lookUpAsI64(itersOp.getLoopSteps()[d], moduleTranslation, builder);
+          moduleTranslation.lookupValue(itersOp.getLoopSteps()[d]);
       assert(lb && ub && st &&
              "Expect lowerBounds, upperBounds, and steps in IteratorOp");
       assert((!llvm::isa<llvm::ConstantInt>(st) ||
@@ -2905,11 +2894,18 @@ public:
       upperBounds[d] = ub;
       steps[d] = st;
 
-      // trips = ((ub - lb) / step) + 1  (inclusive ub, assume positive step)
-      llvm::Value *diff = builder.CreateSub(ub, lb);
-      llvm::Value *div = builder.CreateSDiv(diff, st);
-      trips[d] = builder.CreateAdd(
-          div, llvm::ConstantInt::get(builder.getInt64Ty(), 1));
+      // Use a direction-aware count so an empty range contributes no entries.
+      // Widen by one bit so the span between the bounds cannot overflow.
+      llvm::Type *countTy =
+          builder.getIntNTy(lb->getType()->getIntegerBitWidth() + 1);
+      llvm::Value *start = builder.CreateSExt(lb, countTy);
+      llvm::Value *stop = builder.CreateSExt(ub, countTy);
+      llvm::Value *step = builder.CreateSExt(st, countTy);
+      llvm::Value *count =
+          moduleTranslation.getOpenMPBuilder()->calculateCanonicalLoopTripCount(
+              builder, start, stop, step, /*IsSigned=*/true,
+              /*InclusiveStop=*/true);
+      trips[d] = builder.CreateZExtOrTrunc(count, builder.getInt64Ty());
     }
 
     totalTrips = llvm::ConstantInt::get(builder.getInt64Ty(), 1);
@@ -3050,6 +3046,8 @@ static mlir::LogicalResult convertIteratorRegion(
     tmp = builder.CreateUDiv(tmp, trip);
 
     // physIV_d = lb_d + idx_d * step_d
+    idx =
+        builder.CreateZExtOrTrunc(idx, iterInfo.getLowerBounds()[d]->getType());
     llvm::Value *physIV = builder.CreateAdd(
         iterInfo.getLowerBounds()[d],
         builder.CreateMul(idx, iterInfo.getSteps()[d]), "omp.it.phys_iv");

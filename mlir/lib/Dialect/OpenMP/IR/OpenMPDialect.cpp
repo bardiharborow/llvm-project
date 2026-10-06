@@ -5762,6 +5762,16 @@ LogicalResult IteratorOp::verify() {
   if (!iteratedTy)
     return emitOpError() << "result must be omp.iterated<entry_ty>";
 
+  Block::BlockArgListType ivs = getRegion().front().getArguments();
+  if (getLoopLowerBounds().size() != ivs.size())
+    return emitOpError() << "number of range arguments and IVs do not match";
+
+  for (auto [lb, iv] : llvm::zip_equal(getLoopLowerBounds(), ivs)) {
+    if (lb.getType() != iv.getType())
+      return emitOpError()
+             << "range argument type does not match corresponding IV type";
+  }
+
   for (auto [lb, ub, step] : llvm::zip_equal(
            getLoopLowerBounds(), getLoopUpperBounds(), getLoopSteps())) {
     if (matchPattern(step, m_Zero()))
